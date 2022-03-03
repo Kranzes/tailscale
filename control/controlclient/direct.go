@@ -7,6 +7,7 @@ package controlclient
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,7 +29,9 @@ import (
 	"time"
 
 	"go4.org/mem"
+	"golang.org/x/net/http2"
 	"inet.af/netaddr"
+	"tailscale.com/control/controlhttp"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
@@ -54,6 +58,7 @@ import (
 // Direct is the client that connects to a tailcontrol server for a node.
 type Direct struct {
 	httpc                  *http.Client // HTTP client used to talk to tailcontrol
+	noiseClient            *http.Client // HTTP client used to talk to tailcontrol
 	serverURL              string       // URL of the tailcontrol server
 	timeNow                func() time.Time
 	lastPrintMap           time.Time
@@ -68,12 +73,13 @@ type Direct struct {
 	skipIPForwardingCheck  bool
 	pinger                 Pinger
 
-	mu           sync.Mutex // mutex guards the following fields
-	serverKey    key.MachinePublic
-	persist      persist.Persist
-	authKey      string
-	tryingNewKey key.NodePrivate
-	expiry       *time.Time
+	mu             sync.Mutex // mutex guards the following fields
+	serverKey      key.MachinePublic
+	serverNoiseKey key.MachinePublic
+	persist        persist.Persist
+	authKey        string
+	tryingNewKey   key.NodePrivate
+	expiry         *time.Time
 	// hostinfo is mutated in-place while mu is held.
 	hostinfo      *tailcfg.Hostinfo // always non-nil
 	endpoints     []tailcfg.Endpoint
@@ -200,6 +206,17 @@ func NewDirect(opts Options) (*Direct, error) {
 	return c, nil
 }
 
+// Close closes any open idle connections.
+// TODO(maisem): make this do more.
+func (c *Direct) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.noiseClient != nil {
+		c.noiseClient.CloseIdleConnections()
+	}
+	return nil
+}
+
 // SetHostinfo clones the provided Hostinfo and remembers it for the
 // next update. It reports whether the Hostinfo has changed.
 func (c *Direct) SetHostinfo(hi *tailcfg.Hostinfo) bool {
@@ -295,6 +312,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	persist := c.persist
 	tryingNewKey := c.tryingNewKey
 	serverKey := c.serverKey
+	serverNoiseKey := c.serverNoiseKey
 	authKey := c.authKey
 	hi := c.hostinfo.Clone()
 	backendLogID := hi.BackendLogID
@@ -336,6 +354,19 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		c.mu.Lock()
 		c.serverKey = serverKey
 		c.mu.Unlock()
+	}
+	if serverNoiseKey.IsZero() {
+		var err error
+		serverNoiseKey, err = loadServerNoiseKey(ctx, c.httpc, c.serverURL)
+		if err != nil {
+			c.logf(err.Error())
+			// Don't fail, we might have stopped sending the noise key from the server side.
+		} else {
+			c.logf("control server noise key %s from %s", serverKey.ShortString(), c.serverURL)
+			c.mu.Lock()
+			c.serverNoiseKey = serverNoiseKey
+			c.mu.Unlock()
+		}
 	}
 
 	var oldNodeKey key.NodePublic
@@ -950,8 +981,21 @@ func encode(v interface{}, serverKey key.MachinePublic, mkey key.MachinePrivate)
 	return mkey.SealTo(serverKey, b), nil
 }
 
-func loadServerKey(ctx context.Context, httpc *http.Client, serverURL string) (key.MachinePublic, error) {
-	req, err := http.NewRequest("GET", serverURL+"/key", nil)
+func loadServerKey(ctx context.Context, httpc *http.Client, url string) (key.MachinePublic, error) {
+	return loadKey(ctx, httpc, url+"/key")
+}
+
+func loadServerNoiseKey(ctx context.Context, httpc *http.Client, url string) (key.MachinePublic, error) {
+	url = fmt.Sprintf("%s/server-key?mapRequestVersion=%d", url, tailcfg.CurrentMapRequestVersion)
+	k, err := loadKey(ctx, httpc, url)
+	if err != nil {
+		return k, fmt.Errorf("failed to get server noise key from %q: %w", url, err)
+	}
+	return k, nil
+}
+
+func loadKey(ctx context.Context, httpc *http.Client, keyURL string) (key.MachinePublic, error) {
+	req, err := http.NewRequest("GET", keyURL, nil)
 	if err != nil {
 		return key.MachinePublic{}, fmt.Errorf("create control key request: %v", err)
 	}
@@ -1190,6 +1234,78 @@ func sleepAsRequested(ctx context.Context, logf logger.Logf, timeoutReset chan<-
 	}
 }
 
+func (c *Direct) getNoiseClient(ctx context.Context) (serverURL string, _ *http.Client, _ error) {
+	c.mu.Lock()
+	// TODO(maisem): am I holding this correctly?
+	httpc := c.httpc
+	serverURL = c.serverURL
+	noiseClient := c.noiseClient
+	serverNoiseKey := c.serverNoiseKey
+	c.mu.Unlock()
+	if noiseClient != nil {
+		return serverURL, noiseClient, nil
+	}
+
+	if serverNoiseKey.IsZero() {
+		return "", nil, errors.New("zero serverKey")
+	}
+	machinePrivKey, err := c.getMachinePrivKey()
+	if err != nil {
+		return "", nil, fmt.Errorf("getMachinePrivKey: %w", err)
+	}
+	if machinePrivKey.IsZero() {
+		return "", nil, errors.New("getMachinePrivKey returned zero key")
+	}
+
+	u, err := url.Parse(c.serverURL)
+	if err != nil {
+		return "", nil, err
+	}
+	tr2 := &http2.Transport{
+		DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+			return controlhttp.Dial(ctx, u.Host, machinePrivKey, serverNoiseKey)
+		},
+		AllowHTTP: true,
+	}
+	noiseClient = &http.Client{}
+	*noiseClient = *httpc
+	noiseClient.Transport = tr2
+
+	c.mu.Lock()
+	c.noiseClient = noiseClient
+	c.mu.Unlock()
+
+	return serverURL, noiseClient, nil
+}
+
+func (c *Direct) setDNSNoise(ctx context.Context, req *tailcfg.SetDNSRequest) error {
+	serverURL, noiseClient, err := c.getNoiseClient(ctx)
+	if err != nil {
+		return err
+	}
+	u := fmt.Sprintf("%s/machine/set-dns", serverURL)
+	bodyData, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	res, err := noiseClient.Post(u, "application/json", bytes.NewReader(bodyData))
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		msg, _ := ioutil.ReadAll(res.Body)
+		return fmt.Errorf("set-dns response: %v, %.200s", res.Status, strings.TrimSpace(string(msg)))
+	}
+	var setDNSRes struct{} // no fields yet
+	if err := json.NewDecoder(res.Body).Decode(&setDNSRes); err != nil {
+		c.logf("error decoding SetDNSResponse: %v", err)
+		return fmt.Errorf("set-dns-response: %v", err)
+	}
+
+	return nil
+}
+
 // SetDNS sends the SetDNSRequest request to the control plane server,
 // requesting a DNS record be created or updated.
 func (c *Direct) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) (err error) {
@@ -1199,6 +1315,11 @@ func (c *Direct) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) (err er
 			metricSetDNSError.Add(1)
 		}
 	}()
+	// Try noise first.
+	if err := c.setDNSNoise(ctx, req); err != nil {
+		c.logf("SetDNS failed over noise, falling back to NaCL box: %v", err)
+		return err
+	}
 	c.mu.Lock()
 	serverKey := c.serverKey
 	c.mu.Unlock()
